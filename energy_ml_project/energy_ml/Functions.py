@@ -67,7 +67,31 @@ class StateDetector:
 
         return df_result
     
-def segment_product_cycles(df: pd.DataFrame, energy_col: str = "value", threshold: float = 25.0, min_duration: int = 5) -> pd.DataFrame:
+class RuleBasedStateDetector:
+    def __init__(self, df: pd.DataFrame, energy_col: str = "value"):
+        self.df = df.copy()
+        self.energy_col = energy_col
+
+    def classify_states(self) -> pd.DataFrame:
+        df = self.df.copy()
+
+        def classify(value):
+            if value == 0:
+                return "Off"
+            elif 0 < value <= 20:
+                return "On"
+            elif 20 < value <= 30:
+                return "Standby"
+            elif 30 < value <= 150:
+                return "Normal Production"
+            else:
+                return "Abnormal Production"
+
+        df["state"] = df[self.energy_col].apply(classify)
+        return df
+    
+
+def segment_product_cycles(df: pd.DataFrame, energy_col: str = "value", threshold: float = 10.0, min_duration: int = 5) -> pd.DataFrame:
     """
     Automatically segment the energy time series into product cycles.
 
@@ -91,7 +115,6 @@ def segment_product_cycles(df: pd.DataFrame, energy_col: str = "value", threshol
     for is_active in df["active"]:
         if is_active:
             if not in_cycle:
-                # Start of a new cycle
                 in_cycle = True
                 duration = 1
                 cycle_id += 1
@@ -101,14 +124,59 @@ def segment_product_cycles(df: pd.DataFrame, energy_col: str = "value", threshol
         else:
             if in_cycle:
                 if duration < min_duration:
-                    # Too short: discard this cycle
                     cycle_id -= 1
                 in_cycle = False
             duration = 0
-            cycle_ids.append(0)  # 0 = no cycle
+            cycle_ids.append(0)
 
     df["cycle_id"] = cycle_ids
     df.drop(columns="active", inplace=True)
     return df
 
+def count_units_by_period(df: pd.DataFrame, time_col: str = "timestamp", freq: str = "1H") -> pd.DataFrame:
+    """
+    Count number of production cycles per time period.
 
+    Parameters:
+    - df: DataFrame with a 'cycle_id' column and timestamp.
+    - time_col: Column with timestamps.
+    - freq: Resampling frequency (e.g., '1H' for hourly, '1D' for daily).
+
+    Returns:
+    - DataFrame with counts of cycles per period.
+    """
+    df_cycles = df[df["cycle_id"] > 0].drop_duplicates("cycle_id")
+    df_cycles[time_col] = pd.to_datetime(df_cycles[time_col])
+    df_cycles.set_index(time_col, inplace=True)
+
+    count_by_period = df_cycles.resample(freq)["cycle_id"].count().rename("units_produced").reset_index()
+    return count_by_period
+
+def assess_cycle_quality(df: pd.DataFrame, time_col: str = "timestamp", expected_duration: float = None) -> pd.DataFrame:
+    """
+    Compare cycle durations against a standard and flag anomalies.
+
+    Parameters:
+    - df: DataFrame with 'cycle_id' and 'timestamp'.
+    - expected_duration: Optional fixed expected duration in seconds.
+
+    Returns:
+    - DataFrame with one row per cycle and a 'quality_flag' column.
+    """
+    df_cycles = df[df["cycle_id"] > 0].groupby("cycle_id").agg(
+        start_time=(time_col, "first"),
+        end_time=(time_col, "last")
+    ).reset_index()
+
+    df_cycles["duration_sec"] = (df_cycles["end_time"] - df_cycles["start_time"]).dt.total_seconds()
+
+    if expected_duration is None:
+        expected_duration = df_cycles["duration_sec"].median()
+
+    # Flag if duration is significantly different from expected
+    tolerance = 0.5  # 40% deviation is considered anomalous
+    df_cycles["quality_flag"] = df_cycles["duration_sec"].apply(
+        lambda d: "anomalous" if abs(d - expected_duration) > tolerance * expected_duration else "ok"
+    )
+
+    return df_cycles
